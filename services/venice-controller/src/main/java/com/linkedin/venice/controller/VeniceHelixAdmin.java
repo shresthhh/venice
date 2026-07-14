@@ -365,6 +365,13 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
   private final HelixAdminClient helixAdminClient;
   private TopicManagerRepository topicManagerRepository;
   private final ZkClient zkClient;
+  /**
+   * A dedicated Zk client for reading Helix cluster metadata (System #1 — LIVEINSTANCES, EXTERNALVIEW) directly from
+   * ZK. This is intentionally kept separate from {@link #zkClient}, which owns Venice metadata (System #2). Helix reads
+   * must not ride on {@link #zkClient}: a later HA change repoints {@link #zkClient} at a separate/backup ensemble for
+   * Venice-metadata availability, and these Helix reads must stay on the Helix ZK rather than follow it.
+   */
+  private final ZkClient helixZkClient;
   private final HelixAdapterSerializer adapterSerializer;
   private final ZkAllowlistAccessor allowlistAccessor;
   private final ExecutionIdAccessor executionIdAccessor;
@@ -444,9 +451,8 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
 
   private final Map<String, DeadStoreStats> deadStoreStatsMap = new VeniceConcurrentHashMap<>();
   private final Map<String, LogCompactionStats> logCompactionStatsMap = new VeniceConcurrentHashMap<>();
-  private final Map<String, StoreLifecycleHooks> storeLifecycleHooksInstanceCache = new VeniceConcurrentHashMap<>();
-  private final Set<String> failedHookClasses = ConcurrentHashMap.newKeySet();
   private final Optional<ExternalETLService> externalETLService;
+  private final StoreLifecycleHooksCache storeLifecycleHooksCache;
 
   // Test only.
   public VeniceHelixAdmin(
@@ -498,6 +504,7 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       Optional<ExternalETLService> externalETLService) {
     Validate.notNull(d2Client);
     this.multiClusterConfigs = multiClusterConfigs;
+    this.storeLifecycleHooksCache = new StoreLifecycleHooksCache(multiClusterConfigs.getCommonConfig().getProps());
     this.logContext = multiClusterConfigs.getLogContext();
     VeniceControllerClusterConfig commonConfig = multiClusterConfigs.getCommonConfig();
     this.controllerName =
@@ -539,6 +546,10 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
     // There is no way to get the internal zkClient from HelixManager or HelixAdmin. So create a new one here.
     this.zkClient = ZkClientFactory.newZkClient(multiClusterConfigs.getZkAddress());
     this.zkClient.subscribeStateChanges(new ZkClientStatusStats(metricsRepository, "controller-zk-client"));
+    // System #1 (Helix cluster metadata) reads get their own Zk client on the Helix ZK address, kept off the
+    // Venice-metadata zkClient above. See {@link #helixZkClient}.
+    this.helixZkClient = ZkClientFactory.newZkClient(multiClusterConfigs.getZkAddress());
+    this.helixZkClient.subscribeStateChanges(new ZkClientStatusStats(metricsRepository, "controller-helix-zk-client"));
     this.adapterSerializer = new HelixAdapterSerializer();
     this.asyncStoreChangeNotifier = new AsyncStoreChangeNotifier(
         VeniceComponent.CONTROLLER,
@@ -766,7 +777,7 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
         continue;
       }
 
-      HelixLiveInstanceMonitor liveInstanceMonitor = new HelixLiveInstanceMonitor(this.zkClient, clusterName);
+      HelixLiveInstanceMonitor liveInstanceMonitor = new HelixLiveInstanceMonitor(this.helixZkClient, clusterName);
       DisabledPartitionStats disabledPartitionStats = new DisabledPartitionStats(metricsRepository, clusterName);
       PushJobStatusStats pushJobStatusStats = new PushJobStatusStats(metricsRepository, clusterName);
       disabledPartitionStatMap.put(clusterName, disabledPartitionStats);
@@ -1083,11 +1094,11 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
 
   private boolean isResourceStillAlive(String clusterName, String resourceName) {
     String externalViewPath = "/" + clusterName + "/EXTERNALVIEW/" + resourceName;
-    return zkClient.exists(externalViewPath);
+    return helixZkClient.exists(externalViewPath);
   }
 
   List<String> getAllLiveHelixResources(String clusterName) {
-    return zkClient.getChildren("/" + clusterName + "/EXTERNALVIEW");
+    return helixZkClient.getChildren("/" + clusterName + "/EXTERNALVIEW");
   }
 
   /**
@@ -4935,6 +4946,11 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
     }
 
     int futureVersion = onlineFutureVersion == Store.NON_EXISTING_VERSION ? pushedFutureVersion : onlineFutureVersion;
+    // Use a Store[] holder so we can capture the store object from inside the storeMetadataUpdate
+    // lambda and avoid a second getStore() call outside the lock (which could return a stale or
+    // null reference if the ZK cache hasn't refreshed yet).
+    Store[] capturedStore = new Store[] { null };
+    int[] capturedPreviousVersion = new int[] { -1 };
     storeMetadataUpdate(clusterName, storeName, (store, resources) -> {
       if (!store.isEnableWrites()) {
         throw new VeniceException(
@@ -4998,8 +5014,45 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
           futureVersion,
           storeName);
       getRealTimeTopicSwitcher().transmitVersionSwapMessage(store, previousVersion, futureVersion);
+      // Capture the store object and previous version so post-swap hooks can be invoked outside
+      // the write lock without a second getStore() call.
+      capturedStore[0] = store;
+      capturedPreviousVersion[0] = previousVersion;
       return store;
     });
+    // Invoke post-swap hooks outside the write lock so slow hook implementations (e.g. gRPC
+    // calls) do not hold the per-store lock. capturedStore[0] is null if storeMetadataUpdate
+    // threw before reaching the capture point (in which case the swap did not complete and
+    // hooks should not run).
+    if (capturedStore[0] != null) {
+      try {
+        StoreVersionLifecycleEventOutcome outcome = storeLifecycleHooksCache.invokePostVersionSwapHooks(
+            clusterName,
+            capturedStore[0],
+            futureVersion,
+            capturedPreviousVersion[0],
+            getRegionName(),
+            null);
+        if (StoreVersionLifecycleEventOutcome.ROLLBACK.equals(outcome)
+            || StoreVersionLifecycleEventOutcome.ABORT.equals(outcome)) {
+          LOGGER.debug(
+              "postStoreVersionSwap hooks returned {} for store {} v{}, triggering rollback",
+              outcome,
+              storeName,
+              futureVersion);
+          rollbackToBackupVersion(clusterName, storeName, getRegionName());
+        } else if (!StoreVersionLifecycleEventOutcome.PROCEED.equals(outcome)) {
+          LOGGER.debug("postStoreVersionSwap hooks returned {} for store {} v{}", outcome, storeName, futureVersion);
+        }
+      } catch (Exception e) {
+        LOGGER.error(
+            "Exception in postStoreVersionSwap hook for store {} v{}: {}",
+            storeName,
+            futureVersion,
+            e.getMessage(),
+            e);
+      }
+    }
   }
 
   /**
@@ -5021,6 +5074,11 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       }
     }
 
+    // Use a Store[] holder to capture the store from inside the lambda — avoids a second
+    // getStore() call outside the lock that could return a stale or null reference.
+    Store[] capturedStore = new Store[] { null };
+    int[] capturedVersions = new int[] { NON_EXISTING_VERSION, NON_EXISTING_VERSION }; // [backupVersion,
+                                                                                       // previousVersion]
     storeMetadataUpdate(clusterName, storeName, (store, resources) -> {
       if (!store.isEnableWrites()) {
         throw new VeniceException(
@@ -5049,9 +5107,40 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
           resources::isSourceCluster);
       realTimeTopicSwitcher.transmitVersionSwapMessage(store, previousVersion, backupVersion);
       store.updateVersionStatus(previousVersion, ROLLED_BACK);
-
+      capturedStore[0] = store;
+      capturedVersions[0] = backupVersion;
+      capturedVersions[1] = previousVersion;
       return store;
     });
+    // Invoke post-swap hooks outside the write lock. capturedStore[0] is null if storeMetadataUpdate
+    // threw or there was no backup version, meaning the rollback did not complete and hooks should
+    // not run.
+    if (capturedStore[0] != null) {
+      try {
+        StoreVersionLifecycleEventOutcome outcome = storeLifecycleHooksCache.invokePostVersionSwapHooks(
+            clusterName,
+            capturedStore[0],
+            capturedVersions[0],
+            capturedVersions[1],
+            getRegionName(),
+            null);
+        if (StoreVersionLifecycleEventOutcome.ROLLBACK.equals(outcome)
+            || StoreVersionLifecycleEventOutcome.ABORT.equals(outcome)) {
+          LOGGER.debug(
+              "postStoreVersionSwap hooks returned {} for store {} v{} during rollback — already on backup version, cannot roll back further",
+              outcome,
+              storeName,
+              capturedVersions[0]);
+        }
+      } catch (Exception e) {
+        LOGGER.error(
+            "Exception in postStoreVersionSwap hook for store {} v{}: {}",
+            storeName,
+            capturedVersions[0],
+            e.getMessage(),
+            e);
+      }
+    }
   }
 
   /**
@@ -5884,29 +5973,6 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
     }
   }
 
-  StoreLifecycleHooks getOrCreateHookInstance(LifecycleHooksRecord record) {
-    String className = record.getStoreLifecycleHooksClassName();
-    if (className == null || className.trim().isEmpty()) {
-      LOGGER.warn("Skipping lifecycle hook record with null or empty class name");
-      return null;
-    }
-    if (failedHookClasses.contains(className)) {
-      return null;
-    }
-    return storeLifecycleHooksInstanceCache.computeIfAbsent(className, cn -> {
-      try {
-        return ReflectUtils.callConstructor(
-            ReflectUtils.loadClass(cn),
-            new Class<?>[] { VeniceProperties.class },
-            new Object[] { multiClusterConfigs.getCommonConfig().getProps() });
-      } catch (Exception e) {
-        LOGGER.error("Failed to instantiate lifecycle hook class: {}", cn, e);
-        failedHookClasses.add(cn);
-        return null;
-      }
-    });
-  }
-
   void invokePreStoreDeletionHooks(String clusterName, String storeName, List<LifecycleHooksRecord> lifecycleHooks) {
     invokePreHooks(
         lifecycleHooks,
@@ -6023,7 +6089,8 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       String hookName,
       BiConsumer<StoreLifecycleHooks, VeniceProperties> action) {
     for (LifecycleHooksRecord record: lifecycleHooks) {
-      StoreLifecycleHooks hook = getOrCreateHookInstance(record);
+      StoreLifecycleHooks hook =
+          storeLifecycleHooksCache.getOrInstantiateHook(record.getStoreLifecycleHooksClassName());
       if (hook == null) {
         continue;
       }
@@ -6041,7 +6108,8 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       BiFunction<StoreLifecycleHooks, VeniceProperties, T> action,
       BiConsumer<T, String> outcomeHandler) {
     for (LifecycleHooksRecord record: lifecycleHooks) {
-      StoreLifecycleHooks hook = getOrCreateHookInstance(record);
+      StoreLifecycleHooks hook =
+          storeLifecycleHooksCache.getOrInstantiateHook(record.getStoreLifecycleHooksClassName());
       if (hook == null) {
         continue;
       }
@@ -6567,6 +6635,7 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       helixManager.disconnect();
       topicManagerRepository.close();
       zkClient.close();
+      helixZkClient.close();
       helixAdminClient.close();
     } catch (Exception e) {
       throw new VeniceException("Can not stop controller correctly.", e);
@@ -7942,6 +8011,11 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
       } catch (Exception e) {
         LOGGER.error("Failed to close zkClient. Swallowing and moving on.", e);
       }
+      try {
+        helixZkClient.close();
+      } catch (Exception e) {
+        LOGGER.error("Failed to close helixZkClient. Swallowing and moving on.", e);
+      }
       Utils.closeQuietlyWithErrorLogged(this.pushJobDetailsManager);
       Utils.closeQuietlyWithErrorLogged(this.dataRecoveryManager);
       Utils.closeQuietlyWithErrorLogged(this.participantStoreClientsManager);
@@ -9128,6 +9202,10 @@ public class VeniceHelixAdmin implements Admin, StoreCleaner {
   @VisibleForTesting
   public VeniceControllerMultiClusterConfig getMultiClusterConfigs() {
     return multiClusterConfigs;
+  }
+
+  public StoreLifecycleHooksCache getStoreLifecycleHooksCache() {
+    return storeLifecycleHooksCache;
   }
 
   public Optional<ExternalETLService> getExternalETLService() {
